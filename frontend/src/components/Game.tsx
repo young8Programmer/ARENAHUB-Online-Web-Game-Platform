@@ -25,21 +25,55 @@ export default function Game() {
   const gameRef = useRef<HTMLDivElement>(null);
   const phaserGameRef = useRef<Phaser.Game | null>(null);
   const socketRef = useRef<Socket | null>(null);
-  const { user, token } = useAuth();
+  const { user, token, loading } = useAuth();
   const navigate = useNavigate();
   const [gameState, setGameState] = useState<GameState | null>(null);
   const [status, setStatus] = useState('Connecting...');
+  const updateQueueRef = useRef<any[]>([]);
+  const isProcessingRef = useRef(false);
+
+  // Redirect to login if not authenticated
+  useEffect(() => {
+    if (!loading) {
+      const storedToken = localStorage.getItem('token');
+      if (!storedToken) {
+        navigate('/login');
+        return;
+      }
+      if (!user || !token) {
+        navigate('/login');
+        return;
+      }
+    }
+  }, [user, token, loading, navigate]);
 
   useEffect(() => {
-    if (!gameRef.current || !user || !token) return;
+    if (!gameRef.current || !user || !token || loading) {
+      if (loading) {
+        setStatus('Loading...');
+      } else if (!user || !token) {
+        setStatus('Not authenticated');
+      }
+      return;
+    }
+
+    // Prevent double initialization
+    if (phaserGameRef.current || socketRef.current) {
+      return;
+    }
 
     // Initialize Socket.IO
-    const socketUrl = API_URL.includes('http') 
-      ? API_URL.replace('/api', '')
-      : 'http://localhost:3000';
+    let socketUrl = API_URL || 'http://localhost:3000';
+    if (socketUrl.includes('/api')) {
+      socketUrl = socketUrl.replace('/api', '');
+    }
+    
     const socket = io(socketUrl, {
       auth: { token },
       transports: ['websocket', 'polling'],
+      reconnection: true,
+      reconnectionAttempts: 5,
+      reconnectionDelay: 1000,
     });
 
     socketRef.current = socket;
@@ -48,28 +82,37 @@ export default function Game() {
     class GameScene extends Phaser.Scene {
       private players: Map<string, Phaser.GameObjects.Sprite> = new Map();
       private cursors!: Phaser.Types.Input.Keyboard.CursorKeys;
-      private lastUpdate = 0;
       private myPlayerId: string;
+      private loadingText?: Phaser.GameObjects.Text;
+      private isReady: boolean = false;
+      private socket: Socket;
 
-      constructor() {
+      constructor(socket: Socket, userId: string) {
         super({ key: 'GameScene' });
-        this.myPlayerId = user!.id;
+        this.socket = socket;
+        this.myPlayerId = userId;
       }
 
       create() {
+        console.log('🎮 Phaser GameScene created');
+        
         // Create game background
         this.add.rectangle(400, 300, 800, 600, 0x1a1a2e);
         this.add.rectangle(400, 300, 800, 600, 0x16213e, 0.5);
+        
+        // Add loading text
+        this.loadingText = this.add.text(400, 300, 'Waiting for players...', {
+          fontSize: '24px',
+          color: '#fff',
+        }).setOrigin(0.5);
 
         // Create cursors for movement
         this.cursors = this.input.keyboard!.createCursorKeys();
-
-        // Add WASD keys
         const wasd = this.input.keyboard!.addKeys('W,S,A,D');
 
         // Movement handler
         const movePlayer = () => {
-          if (!socket.connected) return;
+          if (!this.socket.connected) return;
 
           const speed = 200;
           let dx = 0;
@@ -94,14 +137,13 @@ export default function Game() {
                 584,
               );
 
-              socket.emit('player_move', { x: newX, y: newY });
+              this.socket.emit('player_move', { x: newX, y: newY });
             }
           }
         };
 
-        // Update loop
+        // Attack handler
         this.input.keyboard!.on('keydown-SPACE', () => {
-          // Attack nearest player
           const myPlayer = this.players.get(this.myPlayerId);
           if (!myPlayer) return;
 
@@ -117,72 +159,109 @@ export default function Game() {
           });
 
           if (nearestPlayer && nearestPlayer.distance < 50) {
-            socket.emit('player_attack', { targetId: nearestPlayer.id });
+            this.socket.emit('player_attack', { targetId: nearestPlayer.id });
           }
         });
 
-        // Movement update - use Phaser's update loop
+        // Movement update loop
         this.time.addEvent({
-          delay: 16, // ~60 FPS
+          delay: 16,
           callback: movePlayer,
           loop: true,
         });
+
+        // Mark scene as ready AFTER everything is initialized
+        this.isReady = true;
+        console.log('✅ Scene fully ready');
       }
 
       updatePlayers(players: GameState['players']) {
+        // CRITICAL: Check scene readiness FIRST - check multiple times
+        if (!this.isReady || !this.add || !this.sys || !this.scene) {
+          return; // Silently skip if not ready
+        }
+        
+        // Check add methods exist
+        if (typeof this.add.circle !== 'function' || typeof this.add.text !== 'function') {
+          return; // Silently skip if methods don't exist
+        }
+        
+        if (!players || !Array.isArray(players)) {
+          return;
+        }
+        
+        // Remove loading text
+        if (this.loadingText) {
+          this.loadingText.destroy();
+          this.loadingText = undefined;
+        }
+        
         players.forEach((playerData) => {
+          if (!playerData || !playerData.id) return;
+          
           let sprite = this.players.get(playerData.id);
 
           if (!sprite) {
-            // Create new player sprite
-            sprite = this.add.circle(
-              playerData.position.x,
-              playerData.position.y,
-              16,
-              playerData.id === this.myPlayerId ? 0x4ecdc4 : 0xff6b6b,
-            );
-            this.players.set(playerData.id, sprite);
+            // Final check before creating sprite
+            if (!this.add || typeof this.add.circle !== 'function') {
+              return; // Silently skip
+            }
+            
+            try {
+              sprite = this.add.circle(
+                playerData.position.x,
+                playerData.position.y,
+                16,
+                playerData.id === this.myPlayerId ? 0x4ecdc4 : 0xff6b6b,
+              );
+              this.players.set(playerData.id, sprite);
 
-            // Add username label
-            const label = this.add.text(
-              playerData.position.x,
-              playerData.position.y - 25,
-              playerData.username,
-              {
-                fontSize: '12px',
-                color: '#fff',
-                backgroundColor: '#000',
-                padding: { x: 4, y: 2 },
-              },
-            );
-            label.setOrigin(0.5);
-            sprite.setData('label', label);
+              // Check again before creating label
+              if (!this.add || typeof this.add.text !== 'function') {
+                return;
+              }
+
+              const label = this.add.text(
+                playerData.position.x,
+                playerData.position.y - 25,
+                playerData.username,
+                {
+                  fontSize: '12px',
+                  color: '#fff',
+                  backgroundColor: '#000',
+                  padding: { x: 4, y: 2 },
+                },
+              );
+              label.setOrigin(0.5);
+              sprite.setData('label', label);
+            } catch (error) {
+              // Silently catch to prevent loop
+              return;
+            }
           }
 
-          // Update position (interpolate for smooth movement)
-          this.tweens.add({
-            targets: sprite,
-            x: playerData.position.x,
-            y: playerData.position.y,
-            duration: 50,
-            ease: 'Power2',
-          });
+          // Update position
+          if (this.tweens) {
+            this.tweens.add({
+              targets: sprite,
+              x: playerData.position.x,
+              y: playerData.position.y,
+              duration: 50,
+              ease: 'Power2',
+            });
+          } else {
+            sprite.setPosition(playerData.position.x, playerData.position.y);
+          }
 
           // Update label
           const label = sprite.getData('label');
           if (label) {
             label.setPosition(playerData.position.x, playerData.position.y - 25);
-            label.setText(
-              `${playerData.username} (${playerData.health}HP)`,
-            );
+            label.setText(`${playerData.username} (${playerData.health}HP)`);
           }
 
-          // Update color based on health
-          if (playerData.health <= 0) {
-            sprite.setAlpha(0.5);
-          } else {
-            sprite.setAlpha(1);
-          }
+          // Update alpha based on health
+          sprite.setAlpha(playerData.health <= 0 ? 0.5 : 1);
         });
       }
     }
@@ -194,7 +273,7 @@ export default function Game() {
       height: 600,
       parent: gameRef.current,
       backgroundColor: '#0f0f23',
-      scene: GameScene,
+      scene: new GameScene(socket, user!.id),
       physics: {
         default: 'arcade',
         arcade: {
@@ -207,32 +286,87 @@ export default function Game() {
     const phaserGame = new Phaser.Game(config);
     phaserGameRef.current = phaserGame;
 
-    const scene = phaserGame.scene.getScene('GameScene') as GameScene;
+    // Get scene reference
+    const getScene = (): GameScene | null => {
+      return phaserGame.scene.getScene('GameScene') as GameScene | null;
+    };
+
+    // Safe update function with debounce and retry
+    let lastUpdateTime = 0;
+    const UPDATE_THROTTLE = 100; // Max once per 100ms
+    
+    const safeUpdatePlayers = (players: GameState['players']) => {
+      const now = Date.now();
+      if (now - lastUpdateTime < UPDATE_THROTTLE) {
+        return; // Throttle updates
+      }
+      lastUpdateTime = now;
+      
+      if (isProcessingRef.current) {
+        return; // Prevent concurrent updates
+      }
+      
+      const scene = getScene();
+      if (!scene) {
+        return;
+      }
+      
+      const sceneAny = scene as any;
+      // CRITICAL: Check add property directly, not just isReady
+      if (!sceneAny.isReady || !sceneAny.add || !sceneAny.sys || !sceneAny.scene) {
+        return; // Silently skip if not ready
+      }
+      
+      // Double check add is not null
+      if (!sceneAny.add || typeof sceneAny.add.circle !== 'function') {
+        return;
+      }
+      
+      isProcessingRef.current = true;
+      try {
+        scene.updatePlayers(players);
+      } catch (error) {
+        // Silently catch errors to prevent loop
+        console.error('Error in updatePlayers:', error);
+      } finally {
+        isProcessingRef.current = false;
+      }
+    };
 
     // Socket event handlers
     socket.on('connect', () => {
+      console.log('✅ Socket connected!');
       setStatus('Finding match...');
       socket.emit('join_matchmaking');
     });
 
     socket.on('game_started', (data: { roomId: string; players: any[] }) => {
+      console.log('Game started!', data);
       setStatus('Game Started!');
-      scene.updatePlayers(data.players);
+      if (data.players) {
+        // Wait a bit for scene to be fully ready
+        setTimeout(() => {
+          safeUpdatePlayers(data.players);
+        }, 200);
+      }
     });
 
     socket.on('game_state', (state: GameState) => {
       setGameState(state);
       if (state.players) {
-        scene.updatePlayers(state.players);
+        // Throttle game_state updates to prevent loop
+        setTimeout(() => {
+          safeUpdatePlayers(state.players);
+        }, 50);
       }
     });
 
-    socket.on('player_moved', (data: { playerId: string; position: any }) => {
-      // Handle other player movements
+    socket.on('player_moved', () => {
+      // Handled by game_state
     });
 
-    socket.on('player_attacked', (data: { attackerId: string; targetId: string }) => {
-      // Visual feedback for attacks
+    socket.on('player_attacked', () => {
+      // Visual feedback can be added here
     });
 
     socket.on('game_ended', (data: { winnerId: string; scores: Record<string, number>; duration: number }) => {
@@ -244,16 +378,24 @@ export default function Game() {
 
     // Cleanup
     return () => {
-      socket.disconnect();
-      phaserGame.destroy(true);
+      if (socket && socket.connected) {
+        socket.disconnect();
+      }
+      if (phaserGame && !phaserGame.destroyed) {
+        phaserGame.destroy(true);
+      }
+      isProcessingRef.current = false;
+      updateQueueRef.current = [];
+      phaserGameRef.current = null;
+      socketRef.current = null;
     };
-  }, [user, token, navigate]);
+  }, [user, token, loading, navigate]);
 
   return (
     <div className="game-container">
       <div className="game-header">
         <div className="game-status">{status}</div>
-        {gameState && (
+        {gameState && gameState.players && (
           <div className="game-info">
             {gameState.players
               .filter((p) => p.id === user?.id)

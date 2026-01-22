@@ -42,21 +42,32 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
   async handleConnection(client: AuthenticatedSocket) {
     try {
+      console.log('🔌 New socket connection attempt');
+      console.log('Handshake auth:', client.handshake.auth);
+      console.log('Handshake headers:', Object.keys(client.handshake.headers));
+      
       const token = client.handshake.auth?.token || 
                     client.handshake.headers.authorization?.replace('Bearer ', '') ||
                     client.handshake.query?.token as string;
+      
       if (!token) {
-        console.log('No token provided, disconnecting');
+        console.log('❌ No token provided, disconnecting');
         client.disconnect();
         return;
       }
 
+      console.log('🔑 Token received, verifying...');
       const payload = this.jwtService.verify(token);
       client.userId = payload.userId;
       client.username = payload.username;
-      console.log(`User connected: ${client.username} (${client.userId})`);
+      // Store userId in socket data for RemoteSocket access
+      (client as any).data = { userId: payload.userId, username: payload.username };
+      console.log(`✅ User connected: ${client.username} (${client.userId})`);
     } catch (error) {
-      console.log('Authentication failed:', error);
+      console.log('❌ Authentication failed:', error);
+      if (error instanceof Error) {
+        console.log('Error message:', error.message);
+      }
       client.disconnect();
     }
   }
@@ -71,15 +82,18 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
   @SubscribeMessage('join_matchmaking')
   async handleJoinMatchmaking(@ConnectedSocket() client: AuthenticatedSocket) {
     if (!client.userId || !client.username) {
+      console.log('Join matchmaking failed: Not authenticated');
       return { error: 'Not authenticated' };
     }
 
+    console.log(`Player ${client.username} (${client.userId}) joined matchmaking`);
     const roomId = await this.gameRoomService.joinMatchmaking(
       client.userId,
       client.username,
     );
 
     if (roomId) {
+      console.log(`Room created: ${roomId}`);
       client.roomId = roomId;
       client.join(roomId);
 
@@ -88,13 +102,18 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
       if (room) {
         // Update socket IDs for all players in room
         const sockets = await this.server.in(roomId).fetchSockets();
-        sockets.forEach((socket) => {
-          const authSocket = socket as AuthenticatedSocket;
-          const player = room.players.get(authSocket.userId);
-          if (player) {
-            player.socketId = authSocket.id;
+        for (const socket of sockets) {
+          // Try to get userId from socket data or handshake
+          const userId = (socket as any).data?.userId || 
+                         (socket as any).userId ||
+                         (socket.handshake as any).auth?.userId;
+          if (userId) {
+            const player = room.players.get(userId);
+            if (player) {
+              player.socketId = socket.id;
+            }
           }
-        });
+        }
       }
 
       // Start game after short delay
@@ -102,6 +121,7 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
         this.gameRoomService.startRoom(roomId);
         const roomState = this.gameRoomService.getRoomState(roomId);
         if (roomState) {
+          console.log(`Starting game in room ${roomId} with ${roomState.players.length} players`);
           this.server.to(roomId).emit('game_started', {
             roomId,
             players: roomState.players,
@@ -109,6 +129,14 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
           this.startGameLoop(roomId);
         }
       }, 2000);
+    } else {
+      const queueSize = this.gameRoomService.getMatchmakingQueueSize();
+      console.log(`Player ${client.username} queued. Queue size: ${queueSize}`);
+      client.emit('matchmaking_status', { 
+        status: 'queued', 
+        queueSize,
+        message: `Waiting for players... (${queueSize}/${this.gameRoomService['ROOM_SIZE'] || 4})` 
+      });
     }
 
     return { status: roomId ? 'matched' : 'queued', roomId };
@@ -194,8 +222,16 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
     const duration = Math.floor((Date.now() - room.startedAt) / 1000);
     const playerIds = Array.from(room.players.keys());
 
-    // Save match to database
-    await this.gameService.endMatch(roomId, winnerId, scores, duration);
+    try {
+      // Create match first, then end it
+      const match = await this.gameService.createMatch(playerIds);
+      
+      // Save match results to database
+      await this.gameService.endMatch(match.id, winnerId, scores, duration);
+    } catch (error) {
+      console.error('Error saving match:', error);
+      // Continue even if match saving fails
+    }
 
     // Notify players
     this.server.to(roomId).emit('game_ended', {
@@ -205,11 +241,13 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
     });
 
     // Cleanup after delay
-    setTimeout(() => {
+    setTimeout(async () => {
       this.gameRoomService.removeRoom(roomId);
       const sockets = await this.server.in(roomId).fetchSockets();
       sockets.forEach((socket) => {
-        (socket as AuthenticatedSocket).roomId = undefined;
+        // Cleanup roomId from socket data if needed
+        // RemoteSocket doesn't have direct access to roomId
+        // Room cleanup is handled by removeRoom above
       });
     }, 10000);
   }

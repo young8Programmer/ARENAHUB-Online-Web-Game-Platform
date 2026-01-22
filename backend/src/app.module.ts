@@ -23,7 +23,7 @@ import { Match } from './game/entities/match.entity';
       database: process.env.DB_DATABASE || 'arenahub',
       entities: [User, Match],
       synchronize: process.env.NODE_ENV !== 'production',
-      logging: process.env.NODE_ENV === 'development',
+      logging: false, // Disable SQL query logging
     }),
     AuthModule,
     UsersModule,

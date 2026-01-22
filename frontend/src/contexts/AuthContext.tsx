@@ -29,25 +29,44 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     localStorage.getItem('token'),
   );
   const [loading, setLoading] = useState(true);
+  const [verified, setVerified] = useState(false);
 
   useEffect(() => {
+    // Only verify token once on mount
+    if (verified) return;
+
+    const storedToken = localStorage.getItem('token');
+    if (storedToken && !token) {
+      // If token exists in localStorage but not in state, restore it
+      setToken(storedToken);
+      return;
+    }
+
     if (token) {
       axios.defaults.headers.common['Authorization'] = `Bearer ${token}`;
-      // Verify token and get user info
+      // Verify token and get user info (only once)
+      setVerified(true);
       axios
         .get(`${API_URL}/users/profile`)
         .then((res) => {
           setUser(res.data);
         })
-        .catch(() => {
-          localStorage.removeItem('token');
-          setToken(null);
+        .catch((error) => {
+          // Only log and remove token if it's actually invalid (401), not network errors
+          if (error.response?.status === 401) {
+            // Silently remove invalid token
+            localStorage.removeItem('token');
+            setToken(null);
+            setUser(null);
+          }
+          // Ignore network errors (ERR_CONNECTION_REFUSED, etc.)
         })
         .finally(() => setLoading(false));
     } else {
+      setVerified(true);
       setLoading(false);
     }
-  }, [token]);
+  }, [token, verified]);
 
   const login = async (username: string, password: string) => {
     const response = await axios.post(`${API_URL}/auth/login`, {
@@ -58,6 +77,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     localStorage.setItem('token', access_token);
     setToken(access_token);
     setUser(userData);
+    setVerified(true); // Mark as verified after successful login
     axios.defaults.headers.common['Authorization'] = `Bearer ${access_token}`;
   };
 
@@ -70,6 +90,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     localStorage.setItem('token', access_token);
     setToken(access_token);
     setUser(userData);
+    setVerified(true); // Mark as verified after successful registration
     axios.defaults.headers.common['Authorization'] = `Bearer ${access_token}`;
   };
 

@@ -33,17 +33,25 @@ export class GameRoomService {
   private readonly GAME_WIDTH = 800;
   private readonly GAME_HEIGHT = 600;
 
-  constructor(@Inject('REDIS_CLIENT') private redis: Redis) {}
+  constructor(@Inject('REDIS_CLIENT') private redis: Redis | null) {
+    // Redis is optional - we use in-memory storage if Redis is not available
+  }
 
   // Matchmaking
   async joinMatchmaking(userId: string, username: string): Promise<string | null> {
     this.matchmakingQueue.set(userId, { userId, username });
 
+    // For testing: allow single player to start immediately
+    // In production, wait for ROOM_SIZE players
+    const MIN_PLAYERS = 1; // Test mode: start with 1 player
+    
     // Check if we can form a room
-    if (this.matchmakingQueue.size >= this.ROOM_SIZE) {
+    if (this.matchmakingQueue.size >= MIN_PLAYERS) {
       const queuedPlayers = Array.from(this.matchmakingQueue.values()).slice(0, this.ROOM_SIZE);
       const playerIds = queuedPlayers.map(p => p.userId);
       const usernames = queuedPlayers.map(p => p.username);
+      
+      console.log(`🎮 Creating room with ${queuedPlayers.length} players`);
       
       // Remove from queue
       queuedPlayers.forEach(p => this.matchmakingQueue.delete(p.userId));
@@ -51,6 +59,7 @@ export class GameRoomService {
       return this.createRoom(playerIds, usernames);
     }
 
+    console.log(`⏳ Player ${username} queued. Queue size: ${this.matchmakingQueue.size}`);
     return null;
   }
 
@@ -162,11 +171,17 @@ export class GameRoomService {
     room.tick++;
 
     // Check for winner
+    // Game ends only if there are multiple players and only one is alive
+    // OR if all players are dead (shouldn't happen, but safety check)
     const alivePlayers = Array.from(room.players.values()).filter(
       (p) => p.health > 0,
     );
 
-    if (alivePlayers.length <= 1) {
+    // Only end game if:
+    // 1. There are multiple players AND only one is alive (normal win condition)
+    // 2. All players are dead (draw - shouldn't happen)
+    // Don't end if there's only 1 player total (test mode)
+    if (room.players.size > 1 && alivePlayers.length <= 1) {
       room.state = 'finished';
       return {
         finished: true,
@@ -176,6 +191,9 @@ export class GameRoomService {
         ),
       };
     }
+    
+    // For single player mode, don't end the game automatically
+    // Game will continue until player manually leaves or time limit
 
     // Return game state
     return {
